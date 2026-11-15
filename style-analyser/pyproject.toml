@@ -3,5 +3,18 @@ name = "style-analyser"
 version = "0.1.0"
 requires-python = ">=3.13"
 dependencies = [
+    "numpy>=2.5.4",
+    "pillow>=13.0.0",
+    "python-dotenv>=1.2.4",
+    "torch>=2.11.0",
+    "transnetv2-pytorch>=1.0.5",
     "yt-dlp>=2026.10.26",
 ]
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu128" }
