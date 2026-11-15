@@ -13,6 +13,7 @@ import numpy as np
 ROOT = Path(__file__).resolve().parent
 REFERENCE_DIR = ROOT / "reference"
 ANALYSIS_DIR = ROOT / "analysis"
+WORD_EDGE_TOL = 0.1  # seconds; Whisper word timings are roughly this precise
 
 
 def analysis_dir_for(video: Path) -> Path:
@@ -80,3 +81,53 @@ def load_json(path: Path) -> dict | None:
 def save_json(path: Path, data: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def word_context(t: float, words: list[dict]) -> dict:
+    """Where does a cut at time t fall relative to the speech?"""
+    if not words:
+        return {}
+    for idx, w in enumerate(words):
+        if w["start"] <= t < w["end"]:
+            # Inside a word. Whisper's word edges are only good to ~0.1 s, so cuts that close
+            # to an edge are really on that edge.
+            into = t - w["start"]
+            if into <= WORD_EDGE_TOL:
+                position = "at_word_start"
+            elif w["end"] - t <= WORD_EDGE_TOL:
+                position = "at_word_end"
+            else:
+                position = "mid_word"
+            return {
+                "position": position,
+                "word": w["display"],
+                "into_word": round(into, 3),
+                "word_duration": round(w["end"] - w["start"], 3),
+                "prev_word": words[idx - 1]["display"] if idx else None,
+            }
+        if t < w["start"]:
+            prev = words[idx - 1] if idx else None
+            gap_start = prev["end"] if prev else 0.0
+            return {
+                "position": "between_words",
+                "prev_word": prev["display"] if prev else None,
+                "next_word": w["display"],
+                "after_prev_end": round(t - gap_start, 3),
+                "before_next_start": round(w["start"] - t, 3),
+                "gap": round(w["start"] - gap_start, 3),
+                "after_sentence_end": bool(prev and prev["sentence_end"]),
+                "after_clause_end": bool(prev and prev["clause_end"]),
+            }
+    return {"position": "after_speech", "prev_word": words[-1]["display"]}
+
+
+def near_boundary(t: float, words: list[dict], tol: float = 0.12) -> str | None:
+    """Is t within tol seconds of the end of a sentence / clause / any word?"""
+    best = None
+    for w in words:
+        if abs(w["end"] - t) <= tol or (w["end"] <= t <= w["end"] + tol):
+            level = "sentence" if w["sentence_end"] else "clause" if w["clause_end"] else "word"
+            rank = {"sentence": 0, "clause": 1, "word": 2}
+            if best is None or rank[level] < rank[best]:
+                best = level
+    return best
