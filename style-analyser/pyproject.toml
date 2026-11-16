@@ -3,6 +3,7 @@ name = "style-analyser"
 version = "0.1.0"
 requires-python = ">=3.13"
 dependencies = [
+    "fonttools>=4.68.0",
     "matplotlib>=3.11.2",
     "numpy>=2.5.4",
     "onnxruntime>=1.32.0",
@@ -12,6 +13,7 @@ dependencies = [
     "rapidocr>=3.10.0",
     "torch>=2.11.0",
     "transnetv2-pytorch>=1.0.5",
+    "uharfbuzz>=0.57.0",
     "yt-dlp>=2026.10.26",
 ]
 
