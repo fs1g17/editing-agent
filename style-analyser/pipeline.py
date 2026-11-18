@@ -7,8 +7,8 @@ Usage:
 
 Stages (every step skips work that already exists, so a rerun resumes where it stopped):
     1. download   download.py into reference/<creator>/
-    2. analyse    per video, all videos in parallel: transcribe -> shots -> faces -> motion ->
-                  captions -> colour
+    2. analyse    per video, one at a time (caption OCR is CPU-bound): transcribe -> shots -> faces
+                  -> motion -> captions; then verify_faces.py (are the faces the creator?), then colour
     3. font       match_font.py --vlm across the creator's captions
     4. vlm        per video, all videos in parallel: build_timeline -> vlm_shots
     5. tastebook  build_tastebook.py -> analysis/<creator>/TASTEBOOK.md
@@ -30,7 +30,9 @@ from pathlib import Path
 from common import REFERENCE_DIR, ROOT, analysis_dir_for, rel
 
 ANALYSE_STEPS = ["transcribe.py", "detect_shots.py", "detect_faces.py", "detect_motion.py",
-                 "detect_captions.py", "detect_colour.py"]
+                 "detect_captions.py"]
+# after verify_faces.py (creator-level: are the faces the creator?), which can change layouts
+POST_VERIFY_STEPS = ["detect_colour.py"]
 VLM_STEPS = ["build_timeline.py", "vlm_shots.py"]
 ENV = {**os.environ, "PYTHONIOENCODING": "utf-8"}
 
@@ -90,6 +92,9 @@ def main() -> int:
     parser.add_argument("--vlm-jobs", type=int, default=5,
                         help="videos sent to the VLM at the same time (network-bound: parallel is fastest)")
     parser.add_argument("--no-tastebook", action="store_true")
+    parser.add_argument("--analyse-only", action="store_true",
+                        help="stop after the per-video analysis (before the paid VLM/tastebook steps) "
+                             "so the measurements can be checked first")
     args = parser.parse_args()
     urls = list(args.urls)
     if args.file:
@@ -123,6 +128,14 @@ def main() -> int:
     if not videos:
         print("  !! every video failed in analysis - stopping (see the pipeline.log files)", flush=True)
         return 1
+    print("  verifying faces are the creator ...", flush=True)
+    run(["verify_faces.py", creator], ROOT / "analysis" / creator / "verify_faces.log")
+    failed += parallel(videos, POST_VERIFY_STEPS, args.analyse_jobs)
+    videos = [v for v in videos if v.stem not in failed]
+
+    if args.analyse_only:
+        print(f"stopped after analysis ({(time.time() - t0) / 60:.1f} min); rerun with --creator {creator} to continue")
+        return 0
 
     # 3. caption font
     print("[3/5 font]", flush=True)
