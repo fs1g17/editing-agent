@@ -24,6 +24,7 @@ Writes analysis/<creator>/font/:
 from __future__ import annotations
 
 import argparse
+import json
 import re
 import statistics as st
 import sys
@@ -36,6 +37,7 @@ import numpy as np
 from PIL import Image, ImageDraw
 
 from common import ANALYSIS_DIR, ROOT, load_json, probe_video, rel, save_json
+from detect_captions import split_text
 from fontlib import EM, FONTS_DIR, INDEX_PATH, FontInstance, font_axes, ink_box, stroke_width
 
 X_LETTERS = set("acemnorsuvwxz")         # letters that sit exactly between baseline and x-height
@@ -52,24 +54,32 @@ def letters(s: str) -> str:
     return "".join(c for c in s if c.isalpha())
 
 
-def text_coverage(crop: np.ndarray, box_px: tuple[float, float, float, float], lighter: bool) -> dict | None:
-    """Soft text mask (0..1) of the caption line, tight around the ink."""
+def text_coverage(crop: np.ndarray, box_px: tuple[float, float, float, float]) -> dict | None:
+    """Soft text mask (0..1) of the caption line, tight around the ink. Handles captions on a
+    backing box/pill (the text is split from the box, see detect_captions.split_text)."""
     H, W = crop.shape[:2]
     x0, y0, x1, y1 = box_px
     lh = y1 - y0
     X0, X1 = max(0, int(x0 - 0.15 * lh)), min(W, int(x1 + 0.15 * lh))
     Y0, Y1 = max(0, int(y0 - 0.12 * lh)), min(H, int(y1 + 0.12 * lh))
-    region = cv2.cvtColor(crop[Y0:Y1, X0:X1], cv2.COLOR_RGB2GRAY)
-    if region.size < 100:
+    region_rgb = np.ascontiguousarray(crop[Y0:Y1, X0:X1])
+    if region_rgb.size < 300:
         return None
-    _, hi = cv2.threshold(region, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    text = (hi > 0) if lighter else (hi == 0)
-    if text.mean() < 0.03 or text.mean() > 0.7:
+    text, box = split_text(region_rgb)
+    region = cv2.cvtColor(region_rgb, cv2.COLOR_RGB2GRAY)
+    if text.mean() < 0.02 or text.mean() > 0.7:
         return None
-    fg, bg = float(np.median(region[text])), float(np.median(region[~text]))
-    if abs(fg - bg) < 80 or np.std(region[~text]) > 25:  # low contrast or busy background
+    near = cv2.dilate(text.astype(np.uint8), np.ones((5, 5), np.uint8)).astype(bool)
+    back = (box & ~near) if box is not None else ~near
+    if back.sum() < 50:
+        return None
+    fg, bg = float(np.median(region[text])), float(np.median(region[back]))
+    if abs(fg - bg) < 60 or np.std(region[back]) > 25:  # low contrast or busy background
         return None
     cov = np.clip((region.astype(np.float32) - bg) / (fg - bg), 0, 1)
+    if box is not None:
+        inside = cv2.erode(box.astype(np.uint8), np.ones((3, 3), np.uint8)).astype(bool)
+        cov = np.where(inside, cov, 0.0)
     hard = (cov >= 0.5).astype(np.uint8)
     n, lab, stats, cent = cv2.connectedComponentsWithStats(hard, connectivity=8)
     rh, rw = hard.shape
@@ -88,7 +98,7 @@ def text_coverage(crop: np.ndarray, box_px: tuple[float, float, float, float], l
     if b is None:
         return None
     return {"cov": cov[b[1]:b[3], b[0]:b[2]], "hard": kept[b[1]:b[3], b[0]:b[2]],
-            "components": int(keep.sum())}
+            "components": int(keep.sum()), "on_box": box is not None}
 
 
 def load_crops(creator: str) -> list[dict]:
@@ -112,9 +122,10 @@ def load_crops(creator: str) -> list[dict]:
             pad_y = (y1 - y0) * 0.25  # same geometry detect_captions.py used to cut the crop
             CX0, CY0 = max(0, int((x0 - 0.03) * W)), max(0, int((y0 - pad_y) * H))
             box = (x0 * W - CX0, y0 * H - CY0, x1 * W - CX0, y1 * H - CY0)
-            tc = text_coverage(crop, box, cap.get("colour", {}).get("text_is_lighter", True))
-            # the ink must span most of the OCR box, otherwise part of the caption was lost
-            if tc is None or tc["cov"].shape[1] < 0.8 * (box[2] - box[0]):
+            tc = text_coverage(crop, box)
+            # the ink must span most of the OCR box (or of the pill around it), otherwise part of
+            # the caption was lost
+            if tc is None or tc["cov"].shape[1] < (0.55 if tc["on_box"] else 0.8) * (box[2] - box[0]):
                 continue
             out.append({"video": cj.parent.name, "text": text, "start": cap["start"], "crop": crop, **tc})
     return out
@@ -138,6 +149,25 @@ def ink_runs(hard: np.ndarray) -> list[tuple[int, int]]:
 X_FLAT = set("xzvwnmru")       # x-height letters with (nearly) flat tops/bottoms
 CAP_FLAT = set("EFHIKLMNTXZ")   # capitals with flat tops/bottoms
 ASC_FLAT = set("bdhkl")         # lowercase ascenders
+
+
+def slant(hard: np.ndarray) -> float | None:
+    """Slant of the letters in degrees (positive = tops lean right, as in italics): the shear that
+    makes vertical strokes most vertical, i.e. the column profile sharpest."""
+    h, w = hard.shape
+    if h < 12 or w < 2 * h:
+        return None
+    m = hard.astype(np.float32)
+    best, best_a = -1.0, 0.0
+    for a in range(-20, 21):
+        t = np.tan(np.radians(a))
+        M = np.float32([[1, t, h - t * h], [0, 1, 0]])  # x' = x - t * (h - y) + h: undo a lean of angle a
+        sheared = cv2.warpAffine(m, M, (w + 2 * h, h), flags=cv2.INTER_NEAREST)
+        cols = sheared.sum(axis=0)
+        sharp = float((cols ** 2).sum())
+        if sharp > best:
+            best, best_a = sharp, float(a)
+    return best_a
 
 
 def measure(crops: list[dict]) -> dict:
@@ -181,6 +211,9 @@ def measure(crops: list[dict]) -> dict:
     pool = {k: [x for d in per_video.values() for x in d[k]] for k in keys}
     m = {k: med(v) for k, v in pool.items()}
     m["x_to_cap"] = round(1 / m["cap_to_x"], 3) if m["cap_to_x"] else None
+    slants = [a for c in crops if len(letters(c["text"])) >= 5 and (a := slant(c["hard"])) is not None]
+    m["slant_deg"] = round(float(np.median(slants)), 1) if slants else None
+    m["italic"] = bool(m["slant_deg"] is not None and m["slant_deg"] >= 5)
     if m["letter_gap_to_x"] and m["word_space_to_x"]:
         m["word_space_to_letter_gap"] = round(m["word_space_to_x"] / m["letter_gap_to_x"], 2)
     m["x_height_px_range"] = [round(float(np.percentile(pool["x_height_px"], q)), 1) for q in (10, 90)] \
@@ -234,7 +267,9 @@ def score(inst: FontInstance, crops: list[dict]) -> dict | None:
     if any(f is None for f in fits):
         return None
     ious = [f["iou"] for f in fits]
-    return {"score": round(float(np.mean(ious)), 4), "median": round(float(np.median(ious)), 4),
+    keep = sorted(ious)[len(ious) // 5:]  # drop the worst 20%: stray non-caption crops shouldn't decide
+    return {"score": round(float(np.mean(keep)), 4), "mean": round(float(np.mean(ious)), 4),
+            "median": round(float(np.median(ious)), 4),
             "worst": round(float(np.min(ious)), 4),
             "track_em": round(float(np.median([f["track_em"] for f in fits])), 4),
             "track_spread": round(float(np.std([f["track_em"] for f in fits])), 4),
@@ -268,11 +303,13 @@ def pick_crops(crops: list[dict], n: int) -> list[dict]:
 
 def instance_name(e: dict) -> str:
     wd = e["axes"].get("wdth")
-    return f'{e["family"]} {e["weight"]}' + (f" wdth {wd:g}" if wd is not None else "")
+    return (f'{e["family"]} {e["weight"]}' + (" Italic" if e.get("italic") else "")
+            + (f" wdth {wd:g}" if wd is not None else "")
+            + (f" + {e['oblique_deg']:g}deg slant" if e.get("oblique_deg") else ""))
 
 
 def make_instance(e: dict) -> FontInstance:
-    return FontInstance(FONTS_DIR / e["file"], e["axes"])
+    return FontInstance(FONTS_DIR / e["file"], e["axes"], e.get("oblique_deg", 0.0))
 
 
 def rank(entries: list[dict], crops: list[dict], label: str) -> list[dict]:
@@ -310,7 +347,7 @@ def refine(best: dict, crops: list[dict]) -> dict:
             var = best["axes"] | {"wght": float(w)} | ({"wdth": float(d)} if d is not None else {})
             if var == best["axes"]:
                 continue
-            s = score(FontInstance(FONTS_DIR / best["file"], var), crops)
+            s = score(make_instance(best | {"axes": var}), crops)
             if s and s["score"] > top["score"]:
                 top = best | {"weight": w, "axes": var} | s
     return top
@@ -410,6 +447,13 @@ def main() -> int:
     short = [e for e in insts
              if abs(e["stroke"] - m["stroke_to_x"]) <= STROKE_TOL * m["stroke_to_x"]
              and (m["x_to_cap"] is None or abs(e["x_to_cap"] - m["x_to_cap"]) <= RATIO_TOL)]
+    if m["italic"]:
+        # slanted captions: true italics, plus upright fonts slanted by the measured angle
+        # (editing apps' "italic" button usually just shears the upright font)
+        short = [e for e in short if e.get("italic")] +                 [e | {"oblique_deg": m["slant_deg"]} for e in short if not e.get("italic")]
+        print(f"captions lean {m['slant_deg']} deg: testing true italics and slanted uprights")
+    else:
+        short = [e for e in short if not e.get("italic")]
     suggested: dict[str, str] = {f.strip().lower(): "--also" for f in args.also.split(",") if f.strip()}
     vlm = None
     if args.vlm:
@@ -417,7 +461,10 @@ def main() -> int:
         vlm = ask_vlm(crops, m)
         for name in vlm.get("google_fonts", []):
             suggested.setdefault(name.lower(), "vlm")
-    extra = [e for e in insts if e["family"].lower() in suggested and e not in short]
+    in_short = {(e["file"], json.dumps(e["axes"], sort_keys=True), e.get("oblique_deg")) for e in short}
+    extra = [e | ({"oblique_deg": m["slant_deg"]} if m["italic"] and not e.get("italic") else {})
+             for e in insts if e["family"].lower() in suggested and bool(e.get("italic")) <= m["italic"]]
+    extra = [e for e in extra if (e["file"], json.dumps(e["axes"], sort_keys=True), e.get("oblique_deg")) not in in_short]
     print(f"shortlist: {len(short)} of {len(insts)} instances by weight/proportions "
           f"({len({e['family'] for e in short})} families) + {len(extra)} suggested")
 

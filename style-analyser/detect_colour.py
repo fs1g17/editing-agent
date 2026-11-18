@@ -40,7 +40,8 @@ CANVAS_DIFF = 12.0          # Lab distance from the canvas colour that counts as
 CAMERA_ROW_SHARE = 0.5      # a row/column belongs to the inset window if this share differs from canvas
 GRAPHIC_CANVAS_SHARE = 0.4  # faceless frame with this much flat canvas = graphic, otherwise b-roll
 PALETTE_K = 6
-CAST_CHROMA = 12            # pixels below this chroma are "near neutral" (used to read white balance)
+SPLIT_SUPPORT = 4.0         # border strength (x typical edge) that marks a window around a "talking head"
+CAST_CHROMA = 12           # pixels below this chroma are "near neutral" (used to read white balance)
 
 
 # ---------------------------------------------------------------- colour helpers
@@ -243,7 +244,86 @@ def median_stats(items: list[dict]) -> dict:
     return out
 
 
+def window_from_canvas(frames: list[tuple[int, np.ndarray, np.ndarray | None]]) -> tuple[int, int, int, int] | None:
+    """Camera window on a plain canvas, wherever it sits: per frame, the connected region around
+    the face that differs from the canvas colour; the window is the median of those boxes when
+    they agree. Fails (None) on dark canvases, where dark footage blends into the canvas."""
+    boxes = []
+    for _, rgb, face in frames:
+        if face is None or not np.isfinite(face[0]):
+            continue
+        lab = to_lab(rgb)
+        H, W = lab.shape[:2]
+        differs = (np.linalg.norm(lab - canvas_colour(lab), axis=2) > CANVAS_DIFF).astype(np.uint8)
+        differs = cv2.morphologyEx(differs, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
+        n, lab_cc, st, _ = cv2.connectedComponentsWithStats(differs, connectivity=8)
+        cx, cy = min(W - 1, int(face[0] * W)), min(H - 1, int(face[1] * H))
+        k = lab_cc[cy, cx]
+        if k == 0:
+            continue
+        x, y, w, h, area = st[k]
+        if w * h > 0.8 * H * W or area < 0.5 * w * h:  # bled into the canvas, or not a window shape
+            continue
+        boxes.append((y, y + h, x, x + w))
+    if len(boxes) < max(3, 0.3 * len(frames)):
+        return None
+    b = np.array(boxes, float)
+    med = np.median(b, axis=0)
+    H, W = frames[0][1].shape[:2]
+    # the boxes must agree (a template), within ~4% of the frame
+    if np.median(np.abs(b - med), axis=0).max() > 0.04 * max(H, W):
+        return None
+    return tuple(int(v) for v in med)
+
+
 def find_inset_window(frames: list[tuple[int, np.ndarray, np.ndarray | None]]) -> tuple[int, int, int, int] | None:
+    """Camera window of split layouts: on a plain canvas, the region around the face that differs
+    from the canvas (any position/size); otherwise the template-border edge method below."""
+    candidates = [b for b in (window_from_canvas(frames), find_window_edges(frames)) if b]
+    if len(candidates) < 2:
+        return candidates[0] if candidates else None
+    gy, gx = persistent_edges(frames)
+    return max(candidates, key=lambda b: border_support(b, gy, gx))
+
+
+def persistent_edges(frames: list[tuple[int, np.ndarray, np.ndarray | None]]) -> tuple[np.ndarray, np.ndarray]:
+    """Edge strength that persists through every split shot (median over shots of each shot's
+    mean |vertical| and |horizontal| gradient): template borders survive, content doesn't."""
+    H, W = frames[0][1].shape[:2]
+    by_shot: dict[int, list] = {}
+    for shot, rgb, _ in frames:
+        by_shot.setdefault(shot, []).append(rgb)
+    gys, gxs = [], []
+    for rgbs in by_shot.values():
+        gy, gx = np.zeros((H - 1, W)), np.zeros((H, W - 1))
+        for rgb in rgbs:
+            L = to_lab(rgb)[..., 0]
+            gy += np.abs(np.diff(L, axis=0))
+            gx += np.abs(np.diff(L, axis=1))
+        gys.append(gy / len(rgbs))
+        gxs.append(gx / len(rgbs))
+    return np.median(gys, axis=0), np.median(gxs, axis=0)
+
+
+def border_support(box: tuple[int, int, int, int], gy: np.ndarray, gx: np.ndarray) -> float:
+    """How strongly a candidate window's sides sit on persistent edges (sides on the frame
+    boundary don't count: the window may bleed off the frame)."""
+    t, b, l, r = box
+    H, W = gy.shape[0] + 1, gx.shape[1] + 1
+    base = float(np.median(gy)) + float(np.median(gx)) + 1e-3
+    sides = []
+    if t > 2:
+        sides.append(max(float(gy[y, l:r].mean()) for y in range(max(0, t - 3), min(H - 1, t + 2))))
+    if b < H - 2:
+        sides.append(max(float(gy[y, l:r].mean()) for y in range(max(0, b - 3), min(H - 1, b + 2))))
+    if l > 2:
+        sides.append(max(float(gx[t:b, x].mean()) for x in range(max(0, l - 3), min(W - 1, l + 2))))
+    if r < W - 2:
+        sides.append(max(float(gx[t:b, x].mean()) for x in range(max(0, r - 3), min(W - 1, r + 2))))
+    return float(np.mean(sides)) / base if sides else 0.0
+
+
+def find_window_edges(frames: list[tuple[int, np.ndarray, np.ndarray | None]]) -> tuple[int, int, int, int] | None:
     """Locate the camera window of split layouts as (top, bottom, left, right) rows/columns.
 
     `frames` are (shot index, rgb, face) for split-layout frames. The window is part of a
@@ -269,7 +349,9 @@ def find_inset_window(frames: list[tuple[int, np.ndarray, np.ndarray | None]]) -
             gy += np.abs(np.diff(L, axis=0))
             gx += np.abs(np.diff(L, axis=1))
         gy, gx = gy / len(rgbs), gx / len(rgbs)
-        row_prof.append(np.percentile(gy[:, int(0.15 * W):int(0.85 * W)], 20, axis=1))
+        # skip the columns behind the head: heads often break out over the window's top border
+        cols = [x for x in range(int(0.15 * W), int(0.85 * W)) if abs(x - fx) > 1.2 * fw]
+        row_prof.append(np.percentile(gy[:, cols or slice(int(0.15 * W), int(0.85 * W))], 20, axis=1))
         col_prof.append(np.percentile(gx[int(fy + 0.6 * fh):H - 2], 20, axis=0))
     rows, cols = np.median(row_prof, axis=0), np.median(col_prof, axis=0)
 
@@ -283,7 +365,8 @@ def find_inset_window(frames: list[tuple[int, np.ndarray, np.ndarray | None]]) -
         return lo + i, bool(seg[i] > max(0.3, 4 * np.median(profile)))
 
     # top: the clear edge nearest above the face (titles higher up can be persistent edges too)
-    lo, hi = int(0.2 * H), int(fy - 0.3 * fh)
+    # (down to the face centre: big heads often pop out over the window's top border)
+    lo, hi = int(0.2 * H), int(fy)
     if hi - lo < 3:
         return None
     thr = max(0.3, 4 * np.median(rows), 0.4 * rows[lo:hi].max())
@@ -329,11 +412,28 @@ def analyse(video: Path) -> dict:
         sampled.append((f, rgb, shot, layout, face))
     inset_box = find_inset_window([(shot["index"], rgb, face) for _, rgb, shot, layout, face in sampled
                                    if layout == "face_inset"])
+    # A big face in a big window gets labelled "talking_head" by the face step. Look for a window
+    # border around those shots too, and treat a shot as split layout when its frames sit inside a
+    # strong persistent border (full-frame footage has no such straight edge: support ~1).
+    split_box, split_shots = None, set()
+    th = [(shot["index"], rgb, face) for _, rgb, shot, layout, face in sampled if layout == "talking_head"]
+    if th:
+        cand = find_inset_window(th)
+        if cand and (cand[1] - cand[0]) * (cand[3] - cand[2]) < 0.75 * H * W:
+            for idx in {s for s, _, _ in th}:
+                fr = [x for x in th if x[0] == idx]
+                gy, gx = persistent_edges(fr)
+                if border_support(cand, gy, gx) >= SPLIT_SUPPORT:
+                    split_shots.add(idx)
+            split_box = cand if split_shots else None
 
     frames, cam_lab, cam_rgb, gfx_lab, skin_lab, barcode, canvases = [], [], [], [], [], [], []
     for f, rgb, shot, layout, face in sampled:
         lab = to_lab(rgb)
-        cam, kind, _ = camera_mask(lab, layout, face, inset_box)
+        box = inset_box
+        if shot["index"] in split_shots:
+            layout, box = "face_inset", split_box
+        cam, kind, _ = camera_mask(lab, layout, face, box)
         for x0, y0, x1, y1 in caption_boxes.get(f, []):
             pad = 0.25 * (y1 - y0)
             cam[max(0, int((y0 - pad) * H)):int((y1 + pad) * H) + 1,
@@ -357,8 +457,13 @@ def analyse(video: Path) -> dict:
         barcode.append(cv2.resize(rgb, (1, 160), interpolation=cv2.INTER_AREA)[:, 0])
         frames.append(rec)
 
-    cam_frames = [r["camera"] for r in frames if r.get("camera")]
+    # the grade is read from footage of the creator; faceless b-roll / screen content is reported
+    # separately (it is often screens or stock with its own look)
+    face_frames = [r["camera"] for r in frames if r.get("camera") and r["kind"] in ("talking_head", "face_inset")]
+    broll_frames = [r["camera"] for r in frames if r.get("camera") and r["kind"] == "broll"]
+    cam_frames = face_frames or broll_frames
     camera = median_stats(cam_frames)
+    broll = median_stats(broll_frames) if face_frames and broll_frames else None
     if camera:
         # corner/centre lightness; can't tell a grading vignette from a dark room, so not a tag
         vig = [r["camera"]["edge_to_centre"] for r in frames if r.get("camera", {}) and r["camera"].get("edge_to_centre")]
@@ -397,7 +502,13 @@ def analyse(video: Path) -> dict:
         "inset_window": {"top": round(inset_box[0] / H, 3), "bottom": round(inset_box[1] / H, 3),
                          "left": round(inset_box[2] / W, 3), "right": round(inset_box[3] / W, 3)}
         if inset_box else None,
+        "split_window": {"top": round(split_box[0] / H, 3), "bottom": round(split_box[1] / H, 3),
+                         "left": round(split_box[2] / W, 3), "right": round(split_box[3] / W, 3),
+                         "shots": sorted(split_shots),
+                         "note": "large face window: the face step called these shots talking_head"}
+        if split_box else None,
         "camera_grade": camera,
+        "broll_grade": broll,
         "skin": skin,
         "look": look_tags(camera, skin) if camera else [],
         "camera_palette": kmeans_palette(np.concatenate(cam_lab)) if cam_lab else [],

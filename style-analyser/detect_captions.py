@@ -181,6 +181,41 @@ def hexcol(rgb) -> str:
     return "#{:02X}{:02X}{:02X}".format(*[int(c) for c in rgb])
 
 
+def split_text(crop_rgb: np.ndarray) -> tuple[np.ndarray, np.ndarray | None]:
+    """Text mask of a caption crop, plus the mask of a backing box/pill behind it (or None).
+
+    Otsu splits the crop in two; the text is the class that rarely touches the crop border. But
+    when the caption sits on a box, that class is the box (OCR boxes often wrap the whole pill).
+    A box is one solid blob that nearly fills its bounding rectangle, unlike the strokes of a
+    word, so in that case the text is split from the box again, inside the box."""
+    gray = cv2.cvtColor(crop_rgb, cv2.COLOR_RGB2GRAY)
+    _, hi = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    hi = hi > 0
+    border = np.zeros_like(hi)
+    border[:3], border[-3:], border[:, :3], border[:, -3:] = True, True, True, True
+    text = hi if hi[border].mean() < 0.5 else ~hi
+    H, W = text.shape
+    n, lab, st, _ = cv2.connectedComponentsWithStats(text.astype(np.uint8), connectivity=8)
+    if n > 1:
+        big = 1 + int(np.argmax(st[1:, cv2.CC_STAT_AREA]))
+        x, y, w, h, area = st[big]
+        blob = (lab == big).astype(np.uint8)
+        contours, _ = cv2.findContours(blob, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        filled = np.zeros_like(blob)
+        cv2.drawContours(filled, contours, -1, 1, cv2.FILLED)
+        filled = filled.astype(bool)
+        if area > 0.2 * H * W and w > 0.4 * W and filled.sum() > 0.85 * w * h:
+            inner = cv2.erode(filled.astype(np.uint8), np.ones((5, 5), np.uint8)).astype(bool)
+            px = gray[inner]
+            if px.size > 50:
+                thr, _ = cv2.threshold(px.reshape(-1, 1), 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+                box_med = float(np.median(gray[blob.astype(bool)]))
+                text2 = inner & ((gray > thr) if box_med <= thr else (gray <= thr))
+                if text2.sum() > 20:
+                    return text2, filled
+    return text, None
+
+
 def caption_colours(frame_rgb: np.ndarray, box: list[float]) -> dict:
     """Split the caption box into text vs background, then look for an outline ring and a backing box."""
     H, W = frame_rgb.shape[:2]
@@ -191,13 +226,7 @@ def caption_colours(frame_rgb: np.ndarray, box: list[float]) -> dict:
     crop = frame_rgb[Y0:Y1, X0:X1]
     if crop.size == 0:
         return {}
-    gray = cv2.cvtColor(crop, cv2.COLOR_RGB2GRAY)
-    _, hi = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    hi = hi > 0
-    border = np.zeros_like(hi)
-    border[:3], border[-3:], border[:, :3], border[:, -3:] = True, True, True, True
-    # The text class is the one that rarely touches the crop border.
-    text = hi if hi[border].mean() < 0.5 else ~hi
+    text, box_mask = split_text(crop)
     t8 = text.astype(np.uint8)
     k3 = np.ones((3, 3), np.uint8)
     core = cv2.erode(t8, k3).astype(bool)
@@ -226,6 +255,9 @@ def caption_colours(frame_rgb: np.ndarray, box: list[float]) -> dict:
     surround_rgb = _median_rgb(frame_rgb[BY0:BY1, BX0:BX1][mask])
     bg_rgb = _median_rgb(bg_px)
     backing = bg_std < 14 and abs(lum(bg_rgb) - lum(surround_rgb)) > 35
+    if box_mask is not None:  # a pill/box found directly
+        bg_rgb = _median_rgb(crop[box_mask & ~cv2.dilate(t8, np.ones((5, 5), np.uint8)).astype(bool)])
+        backing, outer_rgb = True, bg_rgb
     # Highlight colour (e.g. active word in yellow/green): strongly saturated text pixels.
     # Skin from a hand behind the caption is only mildly saturated, so it doesn't count.
     highlight = None
@@ -406,6 +438,48 @@ def save_crops_and_sheets(events: list[dict], crops: dict[int, np.ndarray], out_
 
 # ---------------------------------------------------------------- main
 
+def colour_pass(video: Path, info: dict, events: list[dict], out_dir: Path) -> None:
+    """Pass 3: full-res frames for colour + crops (middle frame of each caption)."""
+    want = {}
+    for i, ev in enumerate(events):
+        want.setdefault((ev["start_frame"] + ev["end_frame"]) // 2, []).append(i)
+    crops = {}
+    for f, frame in enumerate(iter_frames(video, info["width"], info["height"])):
+        if f not in want:
+            continue
+        rgb = frame[:, :, ::-1]
+        for i in want[f]:
+            ev = events[i]
+            x0 = min(l["box"][0] for l in ev["lines"]); x1 = max(l["box"][2] for l in ev["lines"])
+            y0 = min(l["box"][1] for l in ev["lines"]); y1 = max(l["box"][3] for l in ev["lines"])
+            main = max(ev["lines"], key=lambda l: l["height"])
+            ev["colour"] = caption_colours(rgb, main["box"])
+            pad_y = (y1 - y0) * 0.25
+            Y0, Y1 = max(0, int((y0 - pad_y) * info["height"])), min(info["height"], int((y1 + pad_y) * info["height"]))
+            X0, X1 = max(0, int((x0 - 0.03) * info["width"])), min(info["width"], int((x1 + 0.03) * info["width"]))
+            crops[i] = np.ascontiguousarray(rgb[Y0:Y1, X0:X1])
+    save_crops_and_sheets(events, crops, out_dir / "captions")
+
+
+def colour_stats(events: list[dict]) -> dict:
+    normal = [ev for ev in events if not ev["emphasis"]]
+    fills = Counter(ev.get("colour", {}).get("fill") for ev in normal)
+    boxes = Counter(ev.get("colour", {}).get("backing_box") for ev in normal
+                    if ev.get("colour", {}).get("backing_box"))
+
+    def share(pred, items):
+        return round(sum(1 for x in items if pred(x)) / len(items), 2) if items else None
+    return {
+        "fill_colours": {k: v for k, v in fills.most_common(5) if k},
+        # light text on darker surroundings vs dark text on lighter surroundings
+        "light_text_share": share(lambda ev: ev.get("colour", {}).get("text_is_lighter"), events),
+        "outline_share": share(lambda ev: ev.get("colour", {}).get("outline"), normal),
+        "backing_box_share": share(lambda ev: ev.get("colour", {}).get("backing_box"), normal),
+        "backing_box_colours": {k: v for k, v in boxes.most_common(5)},
+        "highlight_share": share(lambda ev: ev.get("colour", {}).get("highlight"), normal),
+    }
+
+
 def analyse(video: Path) -> dict:
     info = probe_video(video)
     fps = info["fps"]
@@ -473,26 +547,7 @@ def analyse(video: Path) -> dict:
         ev["emphasis"] = any(
             l["height"] >= EMPHASIS_RATIO * typical_by_profile.get(profile(l["text"]), typical_h) for l in ev["lines"])
 
-    # pass 3: full-res frames for colour + crops (middle frame of each caption)
-    want = {}
-    for i, ev in enumerate(events):
-        want.setdefault((ev["start_frame"] + ev["end_frame"]) // 2, []).append(i)
-    crops = {}
-    for f, frame in enumerate(iter_frames(video, info["width"], info["height"])):
-        if f not in want:
-            continue
-        rgb = frame[:, :, ::-1]
-        for i in want[f]:
-            ev = events[i]
-            x0 = min(l["box"][0] for l in ev["lines"]); x1 = max(l["box"][2] for l in ev["lines"])
-            y0 = min(l["box"][1] for l in ev["lines"]); y1 = max(l["box"][3] for l in ev["lines"])
-            main = max(ev["lines"], key=lambda l: l["height"])
-            ev["colour"] = caption_colours(rgb, main["box"])
-            pad_y = (y1 - y0) * 0.25
-            Y0, Y1 = max(0, int((y0 - pad_y) * info["height"])), min(info["height"], int((y1 + pad_y) * info["height"]))
-            X0, X1 = max(0, int((x0 - 0.03) * info["width"])), min(info["width"], int((x1 + 0.03) * info["width"]))
-            crops[i] = np.ascontiguousarray(rgb[Y0:Y1, X0:X1])
-    save_crops_and_sheets(events, crops, out_dir / "captions")
+    colour_pass(video, info, events, out_dir)
 
     # other on-screen text (pass 1 lines that are not captions), deduplicated
     other: dict[str, dict] = {}
@@ -518,7 +573,6 @@ def analyse(video: Path) -> dict:
     leads = [ev["lead_s"] for ev in events if ev["lead_s"] is not None]
     lingers = [ev["linger_s"] for ev in events if ev["linger_s"] is not None]
     normal = [ev for ev in events if not ev["emphasis"]]
-    fills = Counter(ev.get("colour", {}).get("fill") for ev in normal)
 
     def share(pred, items):
         return round(sum(1 for x in items if pred(x)) / len(items), 2) if items else None
@@ -541,12 +595,7 @@ def analyse(video: Path) -> dict:
         "center_x_median": round(float(np.median([l["center_x"] for ev in normal for l in ev["lines"]])), 3) if normal else None,
         "case": dict(Counter(ev["case"] for ev in events)),
         "punctuation_share": share(lambda ev: ev["has_punctuation"], events),
-        "fill_colours": {k: v for k, v in fills.most_common(5) if k},
-        # light text on darker surroundings vs dark text on lighter surroundings
-        "light_text_share": share(lambda ev: ev.get("colour", {}).get("text_is_lighter"), events),
-        "outline_share": share(lambda ev: ev.get("colour", {}).get("outline"), normal),
-        "backing_box_share": share(lambda ev: ev.get("colour", {}).get("backing_box"), normal),
-        "highlight_share": share(lambda ev: ev.get("colour", {}).get("highlight"), normal),
+        **colour_stats(events),
         "emphasis_count": sum(ev["emphasis"] for ev in events),
         "entry_animation": dict(Counter(ev["entry_animation"] for ev in events)),
         "exit_animation": dict(Counter(ev["exit_animation"] for ev in events)),
@@ -566,10 +615,27 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("paths", nargs="*", help="Videos or folders (default: all of reference/)")
     parser.add_argument("--force", action="store_true", help="Re-run even if captions.json exists")
+    parser.add_argument("--recolour", action="store_true",
+                        help="only redo colours, crops and sheets from an existing captions.json (no OCR)")
     args = parser.parse_args()
     videos = collect_videos(args.paths)
     if not videos:
         parser.error("no videos found")
+    if args.recolour:
+        for video in videos:
+            out_file = analysis_dir_for(video) / "captions.json"
+            data = load_json(out_file)
+            if not data:
+                print(f"[skip] {video.name} (no captions.json)")
+                continue
+            print(f"[recolour] {video.name}", flush=True)
+            colour_pass(video, probe_video(video), data["captions"], analysis_dir_for(video))
+            data["stats"].update(colour_stats(data["captions"]))
+            save_json(out_file, data)
+            s = data["stats"]
+            print(f"  -> fills {s['fill_colours']}  box share {s['backing_box_share']} {s['backing_box_colours']}  "
+                  f"light text {s['light_text_share']}")
+        return 0
     for video in videos:
         out_file = analysis_dir_for(video) / "captions.json"
         if out_file.exists() and not args.force:

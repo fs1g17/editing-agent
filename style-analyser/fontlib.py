@@ -41,9 +41,10 @@ def _font_bytes(path: str) -> bytes:
 class FontInstance:
     """One font file at one point in its design space (e.g. Inter at wght=800)."""
 
-    def __init__(self, path: str | Path, axes: dict[str, float] | None = None):
+    def __init__(self, path: str | Path, axes: dict[str, float] | None = None, oblique_deg: float = 0.0):
         self.path = str(path)
         self.axes = axes or {}
+        self.oblique = float(np.tan(np.radians(oblique_deg)))  # synthetic slant, like an app's "italic" toggle
         data = _font_bytes(self.path)
         face = hb.Face(data)
         self.upem = face.upem
@@ -77,14 +78,18 @@ class FontInstance:
         if glyphs is None:
             return None
         track = track_em * EM
-        width = int(sum(a for _, _, a in glyphs) + max(0.0, track) * len(glyphs) + EM)
+        width = int(sum(a for _, _, a in glyphs) + max(0.0, track) * len(glyphs) + EM + abs(self.oblique) * EM * 1.3)
         img = Image.new("L", (width, int(EM * 1.7)), 0)
         d = ImageDraw.Draw(img)
         base_x, base_y = EM * 0.4, EM * 1.25
         for i, (ch, x, _) in enumerate(glyphs):
             if not ch.isspace():
                 d.text((base_x + x + i * track, base_y), ch, font=self.pil, fill=255, anchor="ls")
-        return np.asarray(img, np.float32) / 255.0
+        cov = np.asarray(img, np.float32) / 255.0
+        if self.oblique:  # shear about the baseline: tops move right
+            M = np.float32([[1, -self.oblique, self.oblique * base_y], [0, 1, 0]])
+            cov = cv2.warpAffine(cov, M, (cov.shape[1], cov.shape[0]), flags=cv2.INTER_LINEAR)
+        return cov
 
 
 def ink_box(cov: np.ndarray, thr: float = 0.5) -> tuple[int, int, int, int] | None:

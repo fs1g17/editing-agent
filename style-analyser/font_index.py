@@ -48,8 +48,8 @@ def read_metadata() -> list[dict]:
             style = re.search(r'style: "(\w+)"', block).group(1)
             weight = int(re.search(r"weight: (\d+)", block).group(1))
             fname = re.search(r'filename: "(.+?)"', block).group(1)
-            if style == "normal" and all(f["file"] != fname for f in files):
-                files.append({"file": fname, "weight": weight})
+            if style in ("normal", "italic") and all(f["file"] != fname for f in files):
+                files.append({"file": fname, "weight": weight, "italic": style == "italic"})
         if name and files:
             families.append({"family": name.group(1), "categories": cats,
                              "dir": meta.parent.relative_to(FONTS_DIR).as_posix(), "files": files})
@@ -124,6 +124,7 @@ def main() -> int:
                     continue
                 if stats:
                     entries.append({"family": fam["family"], "category": fam["categories"][0], "weight": weight,
+                                    "italic": spec.get("italic", False),
                                     "file": path.relative_to(FONTS_DIR).as_posix(), "axes": var, **stats})
         if n % 100 == 0:
             print(f"  {n}/{len(families)} families, {len(entries)} instances, {time.time() - t0:.0f}s", flush=True)
